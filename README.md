@@ -1,4 +1,4 @@
-# 📘 Documentazione: k8s-ctx-helper.sh
+# 📘 x-k8s
 
 ## 📌 Descrizione Generale
 
