@@ -1,10 +1,10 @@
 #!/bin/bash
 set -o pipefail
 
-export HTTP_PROXY="http://proxy.csi.it:3128"
-export HTTPS_PROXY="http://proxy.csi.it:3128"
-export http_proxy="http://proxy.csi.it:3128"
-export https_proxy="http://proxy.csi.it:3128"
+export HTTP_PROXY="http://proxy:3128"
+export HTTPS_PROXY="http://proxy:3128"
+export http_proxy="http://proxy:3128"
+export https_proxy="http://proxy:3128"
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 	echo "Usa: source $0 per mantenere le modifiche."
