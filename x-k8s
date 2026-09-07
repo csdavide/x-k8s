@@ -1,0 +1,548 @@
+#!/bin/bash
+set -o pipefail
+
+export HTTP_PROXY="http://proxy.csi.it:3128"
+export HTTPS_PROXY="http://proxy.csi.it:3128"
+export http_proxy="http://proxy.csi.it:3128"
+export https_proxy="http://proxy.csi.it:3128"
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	echo "Usa: source $0 per mantenere le modifiche."
+	exit 1
+fi
+
+if [[ "$HOME" == /root* ]]; then
+    KUBECONFIG_DIR="/mnt/c/Users/${USERNAME}/.kube"
+else
+    KUBECONFIG_DIR="${HOME}/.kube"
+fi
+
+if [[ ! -d "$KUBECONFIG_DIR" ]]; then
+    echo "❌ Directory $KUBECONFIG_DIR non trovata" >&2
+    exit 1
+fi
+
+# --- File di cache ---
+CACHE_FILE="$HOME/.kube/ns_cache"
+declare -A CACHE_MAP
+
+# --- Carica i file kubeconfig, escludendo quelli che contengono "csi" ---
+declare -A K8S_CONTEXT_MAP
+K8S_CONTEXT_MAP=()
+while IFS= read -r file; do
+    base=$(basename "$file")
+    if [[ "$base" == *.yaml || "$base" == *.yml ]]; then
+        K8S_CONTEXT_MAP["$base"]="$file"
+    fi
+done < <(find "$KUBECONFIG_DIR" -maxdepth 1 -type f ! -name ".*" | sort)
+
+if [[ ${#K8S_CONTEXT_MAP[@]} -eq 0 ]]; then
+    echo "❌ Nessun file kubeconfig trovato in $KUBECONFIG_DIR" >&2
+    exit 1
+fi
+
+# ---------- PARSING -x (solo per sourcing) ----------
+RESET_ENV=false
+RESET_NS=false
+RESET_BOTH=false
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "❌ -x richiede un valore: 1 = ENV, 2 = NS, 3 = BOTH" >&2
+                return 1 2>/dev/null || exit 1
+            fi
+            case "$1" in
+                1) RESET_ENV=true ;;
+                2) RESET_NS=true ;;
+                3) RESET_BOTH=true ;;
+                *) echo "❌ Valore non valido per -x: 1 = ENV, 2 = NS, 3 = BOTH" >&2
+                   return 1 2>/dev/null || exit 1 ;;
+            esac
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ "$RESET_ENV" == true ]]; then
+    unset K8S_ENV
+fi
+if [[ "$RESET_BOTH" == true ]]; then
+    unset K8S_NS
+fi
+if [[ "$RESET_BOTH" == true ]]; then
+    unset K8S_ENV
+    unset K8S_NS
+fi
+
+# ---------- FUNZIONI ----------
+
+# Carica la cache da disco, rimuovendo eventuali \r
+load_cache() {
+    if [[ -f "$CACHE_FILE" ]]; then
+        while IFS='|' read -r ns file; do
+            ns="${ns//$'\r'/}"
+            file="${file//$'\r'/}"
+            [[ -n "$ns" && -n "$file" ]] && CACHE_MAP["$ns"]="$file"
+        done < "$CACHE_FILE"
+        return 0
+    fi
+    return 1
+}
+
+# Ricostruisce la cache chiamando le API per ogni kubeconfig
+build_cache() {
+    echo "🔄 Ricostruisco la cache dei namespace (potrebbe richiedere qualche secondo)..." >&2
+    CACHE_MAP=()
+    local tmp_file=$(mktemp)
+    for file in "${!K8S_CONTEXT_MAP[@]}"; do
+        local kube_path="${K8S_CONTEXT_MAP[$file]}"
+        local ns_list
+        ns_list=$(fetch_namespaces_from_file "$kube_path")
+        if [[ $? -ne 0 ]]; then
+            echo "⚠️  Skipping $file: impossibile leggere i namespace" >&2
+            continue
+        fi
+        for ns in $ns_list; do
+            ns="${ns//$'\r'/}"
+            [[ -z "$ns" ]] && continue
+            CACHE_MAP["$ns"]="$file"
+            echo "$ns|$file" >> "$tmp_file"
+        done
+    done
+    if [[ ${#CACHE_MAP[@]} -gt 0 ]]; then
+        mv "$tmp_file" "$CACHE_FILE"
+        echo "✅ Cache salvata in $CACHE_FILE" >&2
+    else
+        echo "❌ Nessun namespace trovato, cache non aggiornata" >&2
+        rm -f "$tmp_file"
+        return 1
+    fi
+}
+
+# Restituisce il file associato a un namespace (usa cache, se non c'è builda)
+get_file_for_namespace() {
+    local ns="$1"
+    ns="${ns//$'\r'/}"
+    if [[ -n "${CACHE_MAP[$ns]}" ]]; then
+        echo "${CACHE_MAP[$ns]}"
+        return 0
+    fi
+    # Se non in cache, ricostruisci e riprova
+    build_cache
+    if [[ -n "${CACHE_MAP[$ns]}" ]]; then
+        echo "${CACHE_MAP[$ns]}"
+        return 0
+    fi
+    return 1
+}
+
+select_interactive() {
+    local prompt="$1"
+    shift
+    local -a options=("$@")
+    local choice
+    local reply
+
+    if [[ ! -t 0 ]] && [[ ! -t 1 ]]; then
+        echo "❌ Non sei in un terminale interattivo. Impossibile selezionare." >&2
+        return 1
+    fi
+
+    echo "$prompt" >&2
+	
+	# Forza il formato verticale: imposta COLUMNS a 1
+    local old_columns="$COLUMNS"
+    export COLUMNS=1
+	
+    PS3="Inserisci il numero: "
+    select choice in "${options[@]}"; do
+        reply="$REPLY"
+        if [[ -n "$choice" ]]; then
+            echo "$reply"   # restituisce l'indice (1-based)
+			export COLUMNS="$old_columns"
+            return 0
+        else
+            if [[ -z "$REPLY" ]]; then
+                echo "❌ Nessuna selezione effettuata. Uscita." >&2
+				export COLUMNS="$old_columns"
+                return 1
+            else
+                echo "Scelta non valida" >&2
+            fi
+        fi
+    done < /dev/tty
+    return 1
+}
+
+# ---------- Estrae il token dal kubeconfig ----------
+get_token_from_kubeconfig() {
+    local kubeconfig="$1"
+
+    if command -v yq >/dev/null 2>&1; then
+        local token
+        token=$(yq e '.users[0].user.token' "$kubeconfig" 2>/dev/null)
+        if [[ -n "$token" && "$token" != "null" ]]; then
+            token="${token//$'\r'/}"
+            echo "$token"
+            return 0
+        fi
+        local token_file
+        token_file=$(yq e '.users[0].user.tokenFile' "$kubeconfig" 2>/dev/null)
+        if [[ -n "$token_file" && "$token_file" != "null" ]]; then
+            token_file="${token_file//$'\r'/}"
+            if [[ -f "$token_file" ]]; then
+                cat "$token_file"
+                return 0
+            else
+                echo "❌ tokenFile $token_file non trovato" >&2
+                return 1
+            fi
+        fi
+    else
+        local token
+        token=$(grep -A 5 "users:" "$kubeconfig" | grep "token:" | head -1 | sed 's/.*token:[[:space:]]*//')
+        if [[ -n "$token" ]]; then
+            token="${token//$'\r'/}"
+            echo "$token"
+            return 0
+        fi
+        local token_file
+        token_file=$(grep -A 5 "users:" "$kubeconfig" | grep "tokenFile:" | head -1 | sed 's/.*tokenFile:[[:space:]]*//')
+        token_file="${token_file//$'\r'/}"
+        if [[ -n "$token_file" && -f "$token_file" ]]; then
+            cat "$token_file"
+            return 0
+        fi
+    fi
+
+    echo "❌ Impossibile estrarre il token dal kubeconfig" >&2
+    return 1
+}
+
+# ---------- Recupera i namespace da un singolo kubeconfig ----------
+# Pulisce tutti i campi da eventuali \r
+fetch_namespaces_from_file() {
+    local kubeconfig="$1"
+    local server
+    server=$(KUBECONFIG="$kubeconfig" kubectl config view --minify -o json | jq -r '.clusters[0].cluster.server')
+    server="${server//$'\r'/}"
+    if [[ -z "$server" ]]; then
+        echo "❌ Impossibile estrarre il server dal kubeconfig" >&2
+        return 1
+    fi
+    
+    local base cluster_id
+    if [[ "$server" =~ (https?://[^/]+) ]]; then
+        base="${BASH_REMATCH[1]}"
+    else
+        base="$server"
+    fi
+    base="${base//$'\r'/}"
+    
+    if [[ "$server" =~ /clusters/([^/]+) ]]; then
+        cluster_id="${BASH_REMATCH[1]}"
+    else
+        echo "❌ Impossibile estrarre cluster_id" >&2
+        return 1
+    fi
+    cluster_id="${cluster_id//$'\r'/}"
+
+    local api_url
+    if [[ -n "$cluster_id" ]]; then
+        api_url="${base}/v3/clusters/${cluster_id}/namespaces"
+    else
+        echo "❌ Impossibile costruire api_url" >&2
+        return 1
+    fi
+
+    local token
+    token=$(get_token_from_kubeconfig "$kubeconfig")
+    token="${token//$'\r'/}"
+    if [[ $? -ne 0 || -z "$token" ]]; then
+        echo "❌ Impossibile estrarre il token" >&2
+        return 1
+    fi
+    token=$(echo "$token" | tr -d '\n\r' | xargs | sed -e 's/^"//' -e 's/"$//')
+
+    local response
+    response=$(curl -sk -H "Authorization: Bearer $token" "$api_url" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "❌ curl fallito per $kubeconfig" >&2
+        return 1
+    fi
+
+    if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        echo "❌ Risposta non JSON per $kubeconfig" >&2
+        return 1
+    fi
+
+    local namespaces
+    namespaces=$(echo "$response" | jq -r '.data[].name' 2>/dev/null)
+    if [[ -z "$namespaces" ]]; then
+        namespaces=$(echo "$response" | jq -r '.items[].metadata.name' 2>/dev/null)
+    fi
+
+    if [[ -z "$namespaces" ]]; then
+        echo "❌ Nessun namespace trovato in $kubeconfig" >&2
+        return 1
+    fi
+
+    # Pulisci e stampa ogni namespace
+    while IFS= read -r ns; do
+        ns="${ns//$'\r'/}"
+        [[ -n "$ns" ]] && echo "$ns"
+    done <<< "$namespaces"
+}
+
+# ---------- Costruisce la lista di tutti i namespace dalla cache, ordinata alfabeticamente ----------
+list_namespaces_from_cache() {
+    local -a namespaces=()
+    for ns in "${!CACHE_MAP[@]}"; do
+        ns="${ns//$'\r'/}"
+        [[ -z "$ns" ]] && continue
+        namespaces+=("$ns")
+    done
+    # Ordina alfabeticamente (ascendente)
+    IFS=$'\n' namespaces=($(sort <<<"${namespaces[*]}"))
+    unset IFS
+    for ns in "${namespaces[@]}"; do
+        echo "$ns|${CACHE_MAP[$ns]}"
+    done
+}
+
+# ---------- Seleziona namespace da tutti i cluster (usa cache) ----------
+select_namespace_all_clusters() {
+    # Assicuriamoci che la cache sia caricata
+    if [[ ${#CACHE_MAP[@]} -eq 0 ]]; then
+        if ! load_cache; then
+            build_cache || return 1
+        fi
+    fi
+
+    local -a all_entries
+    mapfile -t all_entries < <(list_namespaces_from_cache)
+    if [[ ${#all_entries[@]} -eq 0 ]]; then
+        echo "❌ Nessun namespace disponibile su nessun cluster." >&2
+        return 1
+    fi
+
+    local -a display_options=()
+    for entry in "${all_entries[@]}"; do
+        local ns="${entry%|*}"
+        local file="${entry#*|}"
+        ns="${ns//$'\r'/}"
+        file="${file//$'\r'/}"
+        display_options+=("$ns (da $file)")
+    done
+
+    local index
+    index=$(select_interactive "Seleziona namespace :" "${display_options[@]}")
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+
+    # L'indice è 1-based, lo convertiamo a 0-based
+    local selected_entry="${all_entries[$((index-1))]}"
+    if [[ -z "$selected_entry" ]]; then
+        echo "❌ Errore: indice non valido." >&2
+        return 1
+    fi
+
+    local selected_ns="${selected_entry%|*}"
+    local selected_file="${selected_entry#*|}"
+    selected_ns="${selected_ns//$'\r'/}"
+    selected_file="${selected_file//$'\r'/}"
+    echo "$selected_ns|$selected_file"
+}
+
+# ---------- Imposta l'ambiente (KUBECONFIG e K8S_NS) ----------
+setup_k8s_environment() {
+    local override_ns="$1"
+    override_ns="${override_ns//$'\r'/}"
+
+    # Se è stato passato un namespace come argomento
+    if [[ -n "$override_ns" ]]; then
+        # Carica cache (se non già caricata)
+        if [[ ${#CACHE_MAP[@]} -eq 0 ]]; then
+            load_cache
+        fi
+        # Cerca il namespace in cache
+        local file_for_ns="${CACHE_MAP[$override_ns]}"
+        if [[ -n "$file_for_ns" ]]; then
+            file_for_ns="${file_for_ns//$'\r'/}"
+            local kube_path="${K8S_CONTEXT_MAP[$file_for_ns]}"
+            if [[ -f "$kube_path" ]]; then
+                export KUBECONFIG="$kube_path"
+                export K8S_NS="$override_ns"
+                export K8S_ENV="$file_for_ns"
+				
+                echo "✅ Impostato KUBECONFIG=$file_for_ns, NS=$override_ns" >&2
+                return 0
+            else
+                echo "❌ File kubeconfig $file_for_ns non trovato" >&2
+                return 1
+            fi
+        else
+            # Non in cache: ricostruisci la cache e riprova
+            echo "🔄 Namespace '$override_ns' non in cache, rigenero..." >&2
+            build_cache
+            file_for_ns="${CACHE_MAP[$override_ns]}"
+            if [[ -n "$file_for_ns" ]]; then
+                file_for_ns="${file_for_ns//$'\r'/}"
+                local kube_path="${K8S_CONTEXT_MAP[$file_for_ns]}"
+                if [[ -f "$kube_path" ]]; then
+                    export KUBECONFIG="$kube_path"
+                    export K8S_NS="$override_ns"
+                    export K8S_ENV="$file_for_ns"
+                    echo "✅ Impostato KUBECONFIG=$file_for_ns, NS=$override_ns" >&2
+                    return 0
+                fi
+            fi
+            echo "❌ Namespace '$override_ns' non trovato in nessun kubeconfig." >&2
+            return 1
+        fi
+    fi	
+
+    # Selezione interattiva (usa cache)
+    local selection
+    selection=$(select_namespace_all_clusters)
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+
+    local selected_ns="${selection%|*}"
+    local selected_file="${selection#*|}"
+    selected_ns="${selected_ns//$'\r'/}"
+    selected_file="${selected_file//$'\r'/}"
+    local kube_path="${K8S_CONTEXT_MAP[$selected_file]}"
+
+    export KUBECONFIG="$kube_path"
+    export K8S_NS="$selected_ns"
+    export K8S_ENV="$selected_file"
+    echo "✅ Ambiente: $selected_file, Namespace: $selected_ns" >&2
+    return 0
+}
+
+# ---------- Estrae l'ambiente dal nome del file kubeconfig ----------
+extract_env_from_file() {
+    local filename="$1"
+    # Estrae la parte prima del primo trattino come ambiente
+    # Esempi:
+    #   kubeconfig-svil.yaml -> svil
+    #   kubeconfig-prod.yaml -> prod
+    #   config-svil-cluster.yaml -> config (meno specifico)
+    # Usiamo una logica più robusta: cerchiamo 'svil' o 'prod' nel nome
+    if [[ "$filename" =~ (svil|prod) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    # Fallback: usa la prima parola prima del primo . o - 
+    echo "$filename" | cut -d'-' -f2 2>/dev/null || echo "unknown"
+}
+
+# ---------- kns: cambia namespace (ridà la lista da cache) ----------
+kns() {
+    if [[ -n "$1" ]]; then
+        setup_k8s_environment "$1"
+        return $?
+    fi
+
+    # Altrimenti mostra la lista interattiva
+    local selection
+    selection=$(select_namespace_all_clusters)
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+
+    local selected_ns="${selection%|*}"
+    local selected_file="${selection#*|}"
+    selected_ns="${selected_ns//$'\r'/}"
+    selected_file="${selected_file//$'\r'/}"
+    local kube_path="${K8S_CONTEXT_MAP[$selected_file]}"
+
+    export KUBECONFIG="$kube_path"
+    export K8S_NS="$selected_ns"
+    export K8S_ENV="$selected_file"
+    echo "✅ Cambiato: $selected_file, Namespace: $selected_ns" >&2
+}
+
+# ---------- k: comando kubectl con namespace ----------
+k() {
+    kubectl -n "$K8S_NS" "$@"
+}
+
+# ---------- ESECUZIONE ----------
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    if [[ -n "${ARGS[0]}" ]]; then
+        case "${ARGS[0]}" in
+            kns)
+                shift_args=("${ARGS[@]:1}")
+                kns "${shift_args[@]}"
+                ret=$?
+                export -f k kns
+                return $ret
+                ;;
+            reload)
+                build_cache
+                if [[ -n "${ARGS[1]}" ]]; then
+                    setup_k8s_environment "${ARGS[1]}"
+                else
+                    echo "✅ Cache ricostruita. Usa 'source $0 [namespace]' per impostare l'ambiente." >&2
+                fi
+                export -f k kns
+                return 0
+                ;;
+            list)
+                load_cache
+                list_namespaces_from_cache
+                export -f k kns
+                return 0
+                ;;
+            help)
+                echo "Uso:"
+                echo "  source $0 [namespace]                - configura ambiente Kubernetes"
+                echo "  source $0 kns [namespace]            - cambia namespace (interattivo se senza argomento)"
+                echo "  source $0 reload [namespace]         - ricostruisce la cache e (opzionalmente) imposta il namespace"
+                echo "  source $0 list                       - elenca i namespace presenti in cache (ordinati alfabeticamente)"
+                echo "  source $0 help                       - mostra questo messaggio"
+                echo ""
+                echo "Comandi disponibili dopo sourcing:"
+                echo "  k <args>   							 - esegue kubectl nel namespace corrente"
+                echo "  kns [namespace]    					 - cambia namespace"
+                export -f k kns
+                return 0
+                ;;
+            *)
+                # Altrimenti è un namespace
+                setup_k8s_environment "${ARGS[0]}"
+                if [[ $? -eq 0 ]]; then
+                    echo "✅ Ora puoi usare: k get pods" >&2
+                    export -f k kns
+                else
+                    echo "❌ Configurazione fallita." >&2
+                    return 1
+                fi
+                return 0
+                ;;
+        esac
+    else
+        # Nessun argomento: configura interattivamente
+        setup_k8s_environment
+        if [[ $? -eq 0 ]]; then
+            echo "✅ Ora puoi usare: k get pods" >&2
+            export -f k kns
+        else
+            echo "❌ Configurazione fallita." >&2
+            return 1
+        fi
+        return 0
+    fi
+fi
