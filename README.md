@@ -86,55 +86,6 @@ Mostra tutti i namespace con il relativo file kubeconfig.
 
 ---
 
-## 🛠️ Comandi Disponibili Dopo il Sourcing
-
-| Comando | Descrizione |
-|---------|-------------|
-| `k get pods` | Esegue `kubectl -n $K8S_NS get pods` |
-| `k describe pod xxx` | Esegue `kubectl -n $K8S_NS describe pod xxx` |
-| `kns` | Cambia namespace in modo interattivo |
-| `kns my-namespace` | Cambia namespace a `my-namespace` |
-
----
-
-## 🧱 Architettura e Flusso di Lavoro
-
-```
-┌─────────────────────────────────────────────┐
-│           1. Source dello script            │
-└─────────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────┐
-│       2. Carica i file kubeconfig           │
-│      da $HOME/.kube/ (esclude .* )          │
-└─────────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────┐
-│     3. Carica cache da ~/.kube/ns_cache     │
-│   (namespace → file kubeconfig)             │
-└─────────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────┐
-│   4. Seleziona namespace (interattivo o     │
-│   da argomento)                             │
-└─────────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────┐
-│  5. Esporta KUBECONFIG e K8S_NS / K8S_ENV  │
-└─────────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────┐
-│   6. Usa `k` per kubectl con namespace      │
-└─────────────────────────────────────────────┘
-```
-
----
-
 ## 📁 Struttura della Cache
 
 La cache è un file di testo (delimitato da `|`):
@@ -157,35 +108,6 @@ namespace2|kubeconfig-svil.yaml
 | `K8S_ENV`   | Nome del file kubeconfig (es. `kubeconfig-prod.yaml`) |
 | `HTTP_PROXY` | Impostato a `http://proxy...:3128` |
 | `HTTPS_PROXY` | Impostato a `http://proxy...:3128` |
-
----
-
-## 🧪 Esempi di Utilizzo
-
-### Esempio 1: Lavorare su un cluster di sviluppo
-
-```bash
-source k8s-ctx-helper.sh
-# Seleziona 'svil' dalla lista
-k get pods
-k logs my-pod-xxx
-```
-
-### Esempio 2: Cambiare namespace rapidamente
-
-```bash
-source k8s-ctx-helper.sh kns libra
-✅ Cambiato: kubeconfig-svil.yaml, Namespace: libra
-k get pods
-```
-
-### Esempio 3: Ricostruire la cache dopo l'aggiunta di un nuovo namespace
-
-```bash
-source k8s-ctx-helper.sh reload
-🔄 Ricostruisco la cache dei namespace...
-✅ Cache salvata in /home/user/.kube/ns_cache
-```
 
 ---
 
