@@ -155,8 +155,8 @@ namespace2|kubeconfig-svil.yaml
 | `KUBECONFIG` | Percorso del file kubeconfig attivo |
 | `K8S_NS`    | Namespace attivo |
 | `K8S_ENV`   | Nome del file kubeconfig (es. `kubeconfig-prod.yaml`) |
-| `HTTP_PROXY` | Impostato a `http://proxy.csi.it:3128` |
-| `HTTPS_PROXY` | Impostato a `http://proxy.csi.it:3128` |
+| `HTTP_PROXY` | Impostato a `http://proxy...:3128` |
+| `HTTPS_PROXY` | Impostato a `http://proxy...:3128` |
 
 ---
 
